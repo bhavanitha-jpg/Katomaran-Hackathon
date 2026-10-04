@@ -1,91 +1,89 @@
+import os
 import cv2
 import json
 import numpy as np
-
+from datetime import datetime
 from ultralytics import YOLO
 from insightface.app import FaceAnalysis
 
 from database import (
     initialize_database,
     add_visitor,
+    get_all_visitors,
     update_visitor,
-    get_all_visitors
+    add_event,
+    get_unique_visitor_count,
 )
 
-from logger import (
-    initialize_logger,
-    log_event
-)
+from logger import initialize_logger, log_event
 
 
 # ============================================================
 # CONFIGURATION
 # ============================================================
 
-with open("config.json", "r") as f:
+with open("config.json", "r", encoding="utf-8") as f:
     config = json.load(f)
 
-VIDEO_SOURCE = config["video_source"]
-SKIP_FRAMES = config["detection_skip_frames"]
-FACE_THRESHOLD = config["face_similarity_threshold"]
+VIDEO_SOURCE = config.get("video_source", "data/sample_video.mp4")
+SKIP_FRAMES = config.get("detection_skip_frames", 5)
+SIMILARITY_THRESHOLD = config.get("face_similarity_threshold", 0.60)
 MIN_FACE_SIZE = config.get("min_face_size", 80)
 
-OUTPUT_VIDEO = config["output_video"]
+DATABASE_PATH = config.get("database_path", "database/visitors.db")
+ENTRY_LOG_DIR = config.get("entry_log_dir", "logs/entries")
+EXIT_LOG_DIR = config.get("exit_log_dir", "logs/exits")
+OUTPUT_VIDEO = config.get("output_video", "outputs/output.mp4")
 
-# Yellow entry/exit line
+EVENT_LOG = config.get("event_log", "logs/events.log")
+
+# ROI line.
+# For the current 3840x2160 video, 1080 is the middle horizontal line.
 ROI_Y = 1080
 
-# Number of frames before removing an inactive track
+# Remove tracking information after this many missing frames.
 FRAME_EXIT_TIMEOUT = 30
 
+# ============================================================
+# HELPER FUNCTIONS
+# ============================================================
 
-# ============================================================
-# COSINE SIMILARITY
-# ============================================================
 
 def cosine_similarity(a, b):
+    """Calculate cosine similarity between two embeddings."""
 
     a = np.asarray(a, dtype=np.float32)
     b = np.asarray(b, dtype=np.float32)
 
-    denominator = (
-        np.linalg.norm(a)
-        * np.linalg.norm(b)
-    )
+    denominator = np.linalg.norm(a) * np.linalg.norm(b)
 
     if denominator == 0:
         return 0.0
 
-    return float(
-        np.dot(a, b) / denominator
-    )
+    return float(np.dot(a, b) / denominator)
 
-
-# ============================================================
-# FIND MATCHING VISITOR
-# ============================================================
 
 def find_matching_visitor(embedding):
+    """
+    Compare the current face embedding with all registered visitors.
+
+    Returns:
+        visitor_id, similarity
+    """
 
     visitors = get_all_visitors()
 
     best_id = None
-    best_similarity = -1.0
+    best_similarity = 0.0
 
-    for visitor in visitors:
-
-        visitor_id = visitor[0]
-        embedding_json = visitor[4]
+    for visitor_id, first_seen, last_seen, visit_count, embedding_json in visitors:
 
         try:
-
             stored_embedding = np.array(
                 json.loads(embedding_json),
                 dtype=np.float32
             )
-
         except Exception:
-
             continue
 
         similarity = cosine_similarity(
@@ -94,81 +92,167 @@ def find_matching_visitor(embedding):
         )
 
         if similarity > best_similarity:
-
             best_similarity = similarity
             best_id = visitor_id
 
-    if best_similarity >= FACE_THRESHOLD:
-
+    if best_similarity >= SIMILARITY_THRESHOLD:
         return best_id, best_similarity
 
     return None, best_similarity
 
 
-# ============================================================
-# SAVE FACE IMAGE
-# ============================================================
+def get_largest_face(faces):
+    """Return the largest detected face."""
 
-def save_face_image(
-    face_image,
+    if not faces:
+        return None
+
+    return max(
+        faces,
+        key=lambda face: (
+            (face.bbox[2] - face.bbox[0]) *
+            (face.bbox[3] - face.bbox[1])
+        )
+    )
+
+
+def save_event_image(
+    person_crop,
+    face_crop,
     visitor_id,
     track_id,
-    frame_number
+    event_type
 ):
+    """
+    Save an image for an ENTRY or EXIT event.
 
-    import os
+    Preferred image:
+        face crop
 
-    os.makedirs(
-        "logs/entries",
-        exist_ok=True
-    )
+    Fallback:
+        person crop
+    """
+
+    if event_type == "ENTRY":
+        base_dir = ENTRY_LOG_DIR
+    else:
+        base_dir = EXIT_LOG_DIR
+
+    date_folder = datetime.now().strftime("%Y-%m-%d")
+    output_dir = os.path.join(base_dir, date_folder)
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
 
     filename = (
-        f"logs/entries/"
         f"visitor_{visitor_id}_"
         f"track_{track_id}_"
-        f"frame_{frame_number}.jpg"
+        f"{timestamp}.jpg"
     )
 
-    cv2.imwrite(
-        filename,
-        face_image
-    )
+    image_path = os.path.join(output_dir, filename)
 
-    return filename
+    image_to_save = face_crop
+
+    if image_to_save is None or image_to_save.size == 0:
+        image_to_save = person_crop
+
+    if image_to_save is None or image_to_save.size == 0:
+        return None
+
+    success = cv2.imwrite(image_path, image_to_save)
+
+    if not success:
+        print(f"WARNING: Could not save event image: {image_path}")
+        return None
+
+    return image_path
+
+
+def detect_current_face(app, person_crop):
+    """
+    Detect a face from the current person crop.
+
+    Used when an ENTRY/EXIT event occurs so the event image
+    represents the current crossing as closely as possible.
+    """
+
+    if person_crop is None or person_crop.size == 0:
+        return None
+
+    try:
+        faces = app.get(person_crop)
+
+        if not faces:
+            return None
+
+        face = get_largest_face(faces)
+
+        if face is None:
+            return None
+
+        x1, y1, x2, y2 = map(int, face.bbox)
+
+        x1 = max(0, x1)
+        y1 = max(0, y1)
+        x2 = min(person_crop.shape[1], x2)
+        y2 = min(person_crop.shape[0], y2)
+
+        if x2 <= x1 or y2 <= y1:
+            return None
+
+        face_width = x2 - x1
+        face_height = y2 - y1
+
+        if (
+            face_width < MIN_FACE_SIZE
+            or face_height < MIN_FACE_SIZE
+        ):
+            return None
+
+        face_crop = person_crop[y1:y2, x1:x2]
+
+        if face_crop.size == 0:
+            return None
+
+        return face_crop
+
+    except Exception as e:
+        print(f"Face detection during event failed: {e}")
+        return None
 
 
 # ============================================================
-# INITIALIZE DATABASE + LOGGER
+# INITIALIZATION
 # ============================================================
+
+print("=" * 70)
+print("KATOMARAN INTELLIGENT FACE TRACKER")
+print("=" * 70)
 
 initialize_database()
-
 initialize_logger()
 
+os.makedirs("outputs", exist_ok=True)
+os.makedirs(ENTRY_LOG_DIR, exist_ok=True)
+os.makedirs(EXIT_LOG_DIR, exist_ok=True)
 
 # ============================================================
 # LOAD YOLO
 # ============================================================
 
-print()
-print("=" * 60)
-print("Loading YOLO model...")
-print("=" * 60)
+print("\nLoading YOLO model...")
 
 model = YOLO("yolo11n.pt")
 
 print("YOLO model loaded successfully.")
 
-
 # ============================================================
 # LOAD INSIGHTFACE
 # ============================================================
 
-print()
-print("=" * 60)
-print("Loading InsightFace...")
-print("=" * 60)
+print("\nLoading InsightFace model...")
 
 face_app = FaceAnalysis(
     name="buffalo_l",
@@ -182,110 +266,96 @@ face_app.prepare(
 
 print("InsightFace loaded successfully.")
 
-
 # ============================================================
-# OPEN VIDEO
+# OPEN VIDEO / RTSP STREAM
 # ============================================================
 
-print()
-print("=" * 60)
-print("Opening video...")
-print("=" * 60)
+print("\nOpening video source:")
+print(VIDEO_SOURCE)
 
-cap = cv2.VideoCapture(
-    VIDEO_SOURCE
-)
+cap = cv2.VideoCapture(VIDEO_SOURCE)
 
 if not cap.isOpened():
-
-    print("ERROR: Could not open video.")
-
-    raise SystemExit
-
-
-# ============================================================
-# VIDEO INFORMATION
-# ============================================================
-
-FPS = cap.get(
-    cv2.CAP_PROP_FPS
-)
-
-WIDTH = int(
-    cap.get(
-        cv2.CAP_PROP_FRAME_WIDTH
+    raise RuntimeError(
+        f"Could not open video source: {VIDEO_SOURCE}"
     )
-)
 
-HEIGHT = int(
-    cap.get(
-        cv2.CAP_PROP_FRAME_HEIGHT
-    )
-)
+fps = cap.get(cv2.CAP_PROP_FPS)
 
-TOTAL_FRAMES = int(
-    cap.get(
-        cv2.CAP_PROP_FRAME_COUNT
-    )
-)
+if fps <= 0:
+    fps = 30.0
 
-print()
-print("Video information:")
-print(f"FPS: {FPS}")
-print(f"Resolution: {WIDTH} x {HEIGHT}")
-print(f"Total frames: {TOTAL_FRAMES}")
+width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
+print(f"Video FPS    : {fps:.2f}")
+print(f"Video Width  : {width}")
+print(f"Video Height : {height}")
 
 # ============================================================
 # OUTPUT VIDEO
 # ============================================================
 
-fourcc = cv2.VideoWriter_fourcc(
-    *"mp4v"
-)
+fourcc = cv2.VideoWriter_fourcc(*"mp4v")
 
 writer = cv2.VideoWriter(
     OUTPUT_VIDEO,
     fourcc,
-    FPS,
-    (WIDTH, HEIGHT)
+    fps,
+    (width, height)
 )
 
 if not writer.isOpened():
-
-    print(
-        "ERROR: Could not create output video."
+    raise RuntimeError(
+        f"Could not create output video: {OUTPUT_VIDEO}"
     )
 
-    cap.release()
-
-    raise SystemExit
-
-
 # ============================================================
-# TRACK INFORMATION
+# TRACKING STATE
 # ============================================================
 
-# Track ID -> Visitor ID
 track_to_visitor = {}
 
-# Track ID -> Last frame seen
 track_last_seen = {}
 
-# Track ID -> Previous center Y position
 track_previous_y = {}
 
-# Track ID -> Last detected event
-# Prevents repeated ENTRY/EXIT events
 track_last_event = {}
 
+track_face_crops = {}
+
+track_person_crops = {}
+
+# Persistent event state by visitor.
+#
+# This prevents:
+# ENTRY -> ENTRY
+# EXIT  -> EXIT
+#
+# for the same visitor without the opposite event occurring.
+visitor_last_event = {}
+
+frame_count = 0
 
 # ============================================================
-# PROCESS VIDEO
+# START LOGGING
 # ============================================================
 
-frame_number = 0
+log_event(
+    "SYSTEM_START",
+    visitor_id=0,
+    track_id=None,
+    details=(
+        f"Video source={VIDEO_SOURCE}, "
+        f"skip_frames={SKIP_FRAMES}, "
+        f"threshold={SIMILARITY_THRESHOLD}, "
+        f"min_face_size={MIN_FACE_SIZE}"
+    )
+)
 
+# ============================================================
+# MAIN PROCESSING LOOP
+# ============================================================
 
 while True:
 
@@ -294,17 +364,16 @@ while True:
     if not ret:
         break
 
-    frame_number += 1
+    frame_count += 1
 
-
-    # ========================================================
-    # DRAW ENTRY / EXIT LINE
-    # ========================================================
+    # --------------------------------------------------------
+    # DRAW ROI LINE
+    # --------------------------------------------------------
 
     cv2.line(
         frame,
         (0, ROI_Y),
-        (frame.shape[1], ROI_Y),
+        (width, ROI_Y),
         (0, 255, 255),
         5
     )
@@ -319,15 +388,11 @@ while True:
         3
     )
 
-
-    results = None
-
-
-    # ========================================================
+    # --------------------------------------------------------
     # YOLO + BYTETRACK
-    # ========================================================
+    # --------------------------------------------------------
 
-    if frame_number % SKIP_FRAMES == 0:
+    if frame_count % SKIP_FRAMES == 0:
 
         results = model.track(
             frame,
@@ -338,57 +403,50 @@ while True:
             verbose=False
         )
 
-
         if (
-            len(results) > 0
-            and
-            results[0].boxes is not None
-            and
-            results[0].boxes.id is not None
+            results
+            and results[0].boxes is not None
+            and results[0].boxes.id is not None
         ):
 
-            result = results[0]
+            boxes = results[0].boxes
 
-            boxes = result.boxes
+            ids = boxes.id.int().cpu().tolist()
 
+            xyxy = boxes.xyxy.cpu().numpy()
 
-            # =================================================
-            # PROCESS EACH PERSON
-            # =================================================
+            current_track_ids = set()
 
-            for i in range(len(boxes)):
+            for box, track_id in zip(xyxy, ids):
 
-                # ---------------------------------------------
-                # BOUNDING BOX
-                # ---------------------------------------------
+                track_id = int(track_id)
 
-                xyxy = (
-                    boxes
-                    .xyxy[i]
-                    .cpu()
-                    .numpy()
-                )
+                current_track_ids.add(track_id)
 
                 x1, y1, x2, y2 = map(
                     int,
-                    xyxy
+                    box
                 )
 
+                x1 = max(0, x1)
+                y1 = max(0, y1)
 
-                # ---------------------------------------------
-                # TRACK ID
-                # ---------------------------------------------
+                x2 = min(width, x2)
+                y2 = min(height, y2)
 
-                track_id = int(
-                    boxes
-                    .id[i]
-                    .item()
-                )
+                if x2 <= x1 or y2 <= y1:
+                    continue
 
+                # ------------------------------------------------
+                # PERSON CROP
+                # ------------------------------------------------
 
-                # ---------------------------------------------
-                # PERSON CENTRE
-                # ---------------------------------------------
+                person_crop = frame[
+                    y1:y2,
+                    x1:x2
+                ]
+
+                track_person_crops[track_id] = person_crop.copy()
 
                 center_x = int(
                     (x1 + x2) / 2
@@ -398,539 +456,566 @@ while True:
                     (y1 + y2) / 2
                 )
 
+                track_last_seen[track_id] = frame_count
 
-                # ---------------------------------------------
-                # UPDATE LAST SEEN
-                # ---------------------------------------------
-
-                track_last_seen[
-                    track_id
-                ] = frame_number
-
-
-                # =================================================
-                # FACE RECOGNITION
-                # =================================================
+                # ------------------------------------------------
+                # NEW TRACK
+                # ------------------------------------------------
 
                 if track_id not in track_to_visitor:
 
-                    crop_x1 = max(
-                        0,
-                        x1
+                    log_event(
+                        "TRACK_START",
+                        visitor_id=0,
+                        track_id=track_id,
+                        details="New person track detected"
                     )
 
-                    crop_y1 = max(
-                        0,
-                        y1
-                    )
+                    visitor_id = None
 
-                    crop_x2 = min(
-                        WIDTH,
-                        x2
-                    )
+                    # --------------------------------------------
+                    # FACE DETECTION
+                    # --------------------------------------------
 
-                    crop_y2 = min(
-                        HEIGHT,
-                        y2
-                    )
-
-
-                    person_crop = frame[
-                        crop_y1:crop_y2,
-                        crop_x1:crop_x2
-                    ]
-
-
-                    if person_crop.size > 0:
+                    try:
 
                         faces = face_app.get(
                             person_crop
                         )
 
+                    except Exception as e:
 
-                        if len(faces) > 0:
+                        print(
+                            f"Face detection failed "
+                            f"for track {track_id}: {e}"
+                        )
 
-                            # -------------------------------------
-                            # LARGEST FACE
-                            # -------------------------------------
+                        faces = []
 
-                            face = max(
-                                faces,
-                                key=lambda f:
-                                (
-                                    f.bbox[2]
-                                    -
-                                    f.bbox[0]
-                                )
-                                *
-                                (
-                                    f.bbox[3]
-                                    -
-                                    f.bbox[1]
-                                )
+                    face = get_largest_face(faces)
+
+                    if face is not None:
+
+                        face_width = (
+                            face.bbox[2] -
+                            face.bbox[0]
+                        )
+
+                        face_height = (
+                            face.bbox[3] -
+                            face.bbox[1]
+                        )
+
+                        # ----------------------------------------
+                        # FACE SIZE CHECK
+                        # ----------------------------------------
+
+                        if (
+                            face_width >= MIN_FACE_SIZE
+                            and face_height >= MIN_FACE_SIZE
+                        ):
+
+                            embedding = face.embedding
+
+                            # ------------------------------------
+                            # SAVE FACE CROP FOR LATER EVENT
+                            # ------------------------------------
+
+                            fx1, fy1, fx2, fy2 = map(
+                                int,
+                                face.bbox
                             )
 
+                            fx1 = max(0, fx1)
+                            fy1 = max(0, fy1)
 
-                            # -------------------------------------
-                            # FACE SIZE
-                            # -------------------------------------
-
-                            face_width = (
-                                face.bbox[2]
-                                -
-                                face.bbox[0]
+                            fx2 = min(
+                                person_crop.shape[1],
+                                fx2
                             )
 
-                            face_height = (
-                                face.bbox[3]
-                                -
-                                face.bbox[1]
+                            fy2 = min(
+                                person_crop.shape[0],
+                                fy2
                             )
-
-
-                            # -------------------------------------
-                            # MINIMUM FACE SIZE
-                            # -------------------------------------
 
                             if (
-                                face_width >= MIN_FACE_SIZE
-                                and
-                                face_height >= MIN_FACE_SIZE
+                                fx2 > fx1
+                                and fy2 > fy1
                             ):
 
-                                embedding = face.embedding
+                                face_crop = person_crop[
+                                    fy1:fy2,
+                                    fx1:fx2
+                                ]
 
-
-                                # ---------------------------------
-                                # MATCH DATABASE
-                                # ---------------------------------
-
-                                matched_id, similarity = (
-                                    find_matching_visitor(
-                                        embedding
-                                    )
-                                )
-
-
-                                # ---------------------------------
-                                # EXISTING VISITOR
-                                # ---------------------------------
-
-                                if matched_id is not None:
-
-                                    visitor_id = matched_id
-
-                                    update_visitor(
-                                        visitor_id
-                                    )
-
-                                    print(
-                                        f"Track {track_id} "
-                                        f"matched Visitor "
-                                        f"{visitor_id} "
-                                        f"(similarity: "
-                                        f"{similarity:.3f})"
-                                    )
-
-                                    log_event(
-                                        "RECOGNIZED",
-                                        visitor_id,
-                                        track_id,
-                                        (
-                                            f"similarity="
-                                            f"{similarity:.3f}"
-                                        )
-                                    )
-
-
-                                # ---------------------------------
-                                # NEW VISITOR
-                                # ---------------------------------
-
-                                else:
-
-                                    visitor_id = add_visitor(
-                                        embedding
-                                    )
-
-                                    print(
-                                        f"New Visitor "
-                                        f"{visitor_id} "
-                                        f"created for "
-                                        f"Track {track_id} "
-                                        f"(best similarity: "
-                                        f"{similarity:.3f})"
-                                    )
-
-                                    log_event(
-                                        "NEW_VISITOR",
-                                        visitor_id,
-                                        track_id,
-                                        (
-                                            f"best_similarity="
-                                            f"{similarity:.3f}"
-                                        )
-                                    )
-
-
-                                # ---------------------------------
-                                # SAVE IDENTITY
-                                # ---------------------------------
-
-                                track_to_visitor[
+                                track_face_crops[
                                     track_id
-                                ] = visitor_id
+                                ] = face_crop.copy()
 
+                            # ------------------------------------
+                            # EMBEDDING GENERATED
+                            # ------------------------------------
 
-                                # ---------------------------------
-                                # SAVE FACE IMAGE
-                                # ---------------------------------
+                            log_event(
+                                "EMBEDDING_GENERATED",
+                                visitor_id=0,
+                                track_id=track_id,
+                                details=(
+                                    f"Embedding generated "
+                                    f"for face size "
+                                    f"{int(face_width)}x"
+                                    f"{int(face_height)}"
+                                )
+                            )
 
-                                save_face_image(
-                                    person_crop,
-                                    visitor_id,
-                                    track_id,
-                                    frame_number
+                            # ------------------------------------
+                            # MATCH DATABASE
+                            # ------------------------------------
+
+                            matched_id, similarity = (
+                                find_matching_visitor(
+                                    embedding
+                                )
+                            )
+
+                            if matched_id is not None:
+
+                                visitor_id = matched_id
+
+                                update_visitor(
+                                    visitor_id
                                 )
 
+                                log_event(
+                                    "RECOGNIZED",
+                                    visitor_id=visitor_id,
+                                    track_id=track_id,
+                                    details=(
+                                        f"similarity="
+                                        f"{similarity:.3f}"
+                                    )
+                                )
+
+                                print(
+                                    f"Track {track_id} "
+                                    f"recognized as Visitor "
+                                    f"{visitor_id} "
+                                    f"(similarity="
+                                    f"{similarity:.3f})"
+                                )
 
                             else:
 
-                                print(
-                                    f"Track {track_id}: "
-                                    f"face too small "
-                                    f"({int(face_width)}x"
-                                    f"{int(face_height)})"
+                                visitor_id = add_visitor(
+                                    embedding
                                 )
 
+                                log_event(
+                                    "NEW_VISITOR",
+                                    visitor_id=visitor_id,
+                                    track_id=track_id,
+                                    details=(
+                                        f"New face registered; "
+                                        f"best_similarity="
+                                        f"{similarity:.3f}"
+                                    )
+                                )
+
+                                print(
+                                    f"Track {track_id}: "
+                                    f"New Visitor "
+                                    f"{visitor_id} "
+                                    f"registered"
+                                )
 
                         else:
 
                             print(
                                 f"Track {track_id}: "
-                                f"No face detected"
+                                f"face too small for recognition "
+                                f"({int(face_width)}x"
+                                f"{int(face_height)})"
                             )
 
+                    else:
 
-                # =================================================
-                # ACTUAL ENTRY / EXIT LINE CROSSING
-                # =================================================
+                        print(
+                            f"Track {track_id}: "
+                            f"No face detected"
+                        )
 
-                if track_id in track_previous_y:
+                    # --------------------------------------------
+                    # STORE VISITOR ID
+                    # --------------------------------------------
 
-                    previous_y = (
-                        track_previous_y[
-                            track_id
-                        ]
-                    )
+                    track_to_visitor[
+                        track_id
+                    ] = visitor_id
 
+                    track_last_event[
+                        track_id
+                    ] = None
 
-                    # ---------------------------------------------
-                    # ABOVE -> BELOW
+                # ------------------------------------------------
+                # CURRENT VISITOR
+                # ------------------------------------------------
+
+                visitor_id = track_to_visitor.get(
+                    track_id
+                )
+
+                previous_y = track_previous_y.get(
+                    track_id
+                )
+
+                # ------------------------------------------------
+                # ROI CROSSING
+                # ------------------------------------------------
+
+                if (
+                    visitor_id is not None
+                    and previous_y is not None
+                ):
+
+                    event_type = None
+
+                    # Moving downward:
                     # ENTRY
-                    # ---------------------------------------------
-
                     if (
                         previous_y < ROI_Y
-                        and
-                        center_y >= ROI_Y
+                        and center_y >= ROI_Y
                     ):
+                        event_type = "ENTRY"
 
-                        if (
-                            track_last_event.get(track_id)
-                            != "ENTRY"
-                        ):
-
-                            if track_id in track_to_visitor:
-
-                                visitor_id = (
-                                    track_to_visitor[
-                                        track_id
-                                    ]
-                                )
-
-
-                                log_event(
-                                    "ENTRY",
-                                    visitor_id,
-                                    track_id,
-                                    (
-                                        "Crossed ROI "
-                                        "downward"
-                                    )
-                                )
-
-
-                                print(
-                                    f"ENTRY -> "
-                                    f"Visitor {visitor_id} "
-                                    f"(Track {track_id})"
-                                )
-
-
-                                track_last_event[
-                                    track_id
-                                ] = "ENTRY"
-
-
-                    # ---------------------------------------------
-                    # BELOW -> ABOVE
+                    # Moving upward:
                     # EXIT
-                    # ---------------------------------------------
-
                     elif (
                         previous_y > ROI_Y
-                        and
-                        center_y <= ROI_Y
+                        and center_y <= ROI_Y
                     ):
+                        event_type = "EXIT"
+
+                    if event_type is not None:
+
+                        last_visitor_event = (
+                            visitor_last_event.get(
+                                visitor_id
+                            )
+                        )
+
+                        # ----------------------------------------
+                        # DUPLICATE EVENT PROTECTION
+                        # ----------------------------------------
 
                         if (
-                            track_last_event.get(track_id)
-                            != "EXIT"
+                            last_visitor_event
+                            == event_type
                         ):
 
-                            if track_id in track_to_visitor:
+                            print(
+                                f"Ignored duplicate "
+                                f"{event_type} for "
+                                f"Visitor {visitor_id}"
+                            )
 
-                                visitor_id = (
-                                    track_to_visitor[
-                                        track_id
-                                    ]
+                        else:
+
+                            # ------------------------------------
+                            # DETECT CURRENT FACE
+                            # ------------------------------------
+
+                            current_face_crop = (
+                                detect_current_face(
+                                    face_app,
+                                    person_crop
                                 )
+                            )
 
+                            if current_face_crop is None:
 
-                                log_event(
-                                    "EXIT",
-                                    visitor_id,
-                                    track_id,
-                                    (
-                                        "Crossed ROI "
-                                        "upward"
+                                current_face_crop = (
+                                    track_face_crops.get(
+                                        track_id
                                     )
                                 )
 
+                            # ------------------------------------
+                            # SAVE EVENT IMAGE
+                            # ------------------------------------
 
-                                print(
-                                    f"EXIT -> "
-                                    f"Visitor {visitor_id} "
-                                    f"(Track {track_id})"
+                            image_path = (
+                                save_event_image(
+                                    person_crop=person_crop,
+                                    face_crop=current_face_crop,
+                                    visitor_id=visitor_id,
+                                    track_id=track_id,
+                                    event_type=event_type
                                 )
+                            )
 
+                            # ------------------------------------
+                            # DATABASE EVENT
+                            # ------------------------------------
 
-                                track_last_event[
-                                    track_id
-                                ] = "EXIT"
+                            timestamp = (
+                                datetime.now().isoformat()
+                            )
 
+                            add_event(
+                                visitor_id=visitor_id,
+                                track_id=track_id,
+                                event_type=event_type,
+                                timestamp=timestamp,
+                                image_path=image_path,
+                                details=(
+                                    "Crossed ROI "
+                                    f"{'downward' if event_type == 'ENTRY' else 'upward'}"
+                                )
+                            )
 
-                # ---------------------------------------------
-                # STORE CURRENT Y
-                # ---------------------------------------------
+                            # ------------------------------------
+                            # EVENT LOG
+                            # ------------------------------------
+
+                            log_event(
+                                event_type,
+                                visitor_id=visitor_id,
+                                track_id=track_id,
+                                details=(
+                                    f"Crossed ROI "
+                                    f"{'downward' if event_type == 'ENTRY' else 'upward'}; "
+                                    f"image={image_path}"
+                                )
+                            )
+
+                            print(
+                                f"{event_type}: "
+                                f"Visitor {visitor_id} "
+                                f"| Track {track_id} "
+                                f"| Image: {image_path}"
+                            )
+
+                            # ------------------------------------
+                            # UPDATE EVENT STATE
+                            # ------------------------------------
+
+                            visitor_last_event[
+                                visitor_id
+                            ] = event_type
+
+                            track_last_event[
+                                track_id
+                            ] = event_type
+
+                # ------------------------------------------------
+                # SAVE PREVIOUS POSITION
+                # ------------------------------------------------
 
                 track_previous_y[
                     track_id
                 ] = center_y
 
+                # ------------------------------------------------
+                # DRAW TRACKING BOX
+                # ------------------------------------------------
 
-                # =================================================
-                # DRAW PERSON
-                # =================================================
-
-                if track_id in track_to_visitor:
-
-                    visitor_id = (
-                        track_to_visitor[
-                            track_id
-                        ]
-                    )
+                if visitor_id is not None:
 
                     label = (
-                        f"Visitor {visitor_id} | "
-                        f"Track {track_id}"
+                        f"Visitor {visitor_id} "
+                        f"| Track {track_id}"
+                    )
+
+                    box_color = (
+                        0,
+                        255,
+                        0
                     )
 
                 else:
 
                     label = (
-                        f"Unknown | "
-                        f"Track {track_id}"
+                        f"Unknown "
+                        f"| Track {track_id}"
                     )
 
-
-                # ---------------------------------------------
-                # PERSON BOX
-                # ---------------------------------------------
+                    box_color = (
+                        0,
+                        165,
+                        255
+                    )
 
                 cv2.rectangle(
                     frame,
                     (x1, y1),
                     (x2, y2),
-                    (0, 255, 0),
+                    box_color,
                     4
                 )
-
-
-                # ---------------------------------------------
-                # LABEL
-                # ---------------------------------------------
 
                 cv2.putText(
                     frame,
                     label,
-                    (
-                        x1,
-                        max(
-                            40,
-                            y1 - 10
-                        )
-                    ),
+                    (x1, max(40, y1 - 10)),
                     cv2.FONT_HERSHEY_SIMPLEX,
-                    1.0,
-                    (0, 255, 0),
+                    1.1,
+                    box_color,
                     3
                 )
 
-
-                # ---------------------------------------------
-                # CENTRE POINT
-                # ---------------------------------------------
-
+                # Center point
                 cv2.circle(
                     frame,
-                    (
-                        center_x,
-                        center_y
-                    ),
+                    (center_x, center_y),
                     8,
                     (255, 0, 0),
                     -1
                 )
 
+            # ----------------------------------------------------
+            # TRACK LOSS
+            # ----------------------------------------------------
 
-    # ========================================================
-    # REMOVE LOST TRACKS
-    # ========================================================
+            for track_id in list(track_last_seen.keys()):
 
-    disappeared_tracks = []
+                if track_id in current_track_ids:
+                    continue
 
+                missing_frames = (
+                    frame_count -
+                    track_last_seen[track_id]
+                )
 
-    for track_id in list(
-        track_last_seen.keys()
-    ):
+                if missing_frames > FRAME_EXIT_TIMEOUT:
 
-        if (
-            frame_number
-            -
-            track_last_seen[track_id]
-            >
-            FRAME_EXIT_TIMEOUT
-        ):
+                    visitor_id = (
+                        track_to_visitor.get(
+                            track_id
+                        )
+                    )
 
-            disappeared_tracks.append(
-                track_id
-            )
+                    log_event(
+                        "TRACK_LOST",
+                        visitor_id=(
+                            visitor_id
+                            if visitor_id is not None
+                            else 0
+                        ),
+                        track_id=track_id,
+                        details=(
+                            f"Track lost after "
+                            f"{missing_frames} frames"
+                        )
+                    )
 
+                    print(
+                        f"Track {track_id} lost"
+                    )
 
-    for track_id in disappeared_tracks:
+                    track_last_seen.pop(
+                        track_id,
+                        None
+                    )
 
-        # ---------------------------------------------
-        # IMPORTANT:
-        # We DO NOT call this an EXIT anymore.
-        # EXIT is only caused by crossing the ROI line.
-        # ---------------------------------------------
+                    track_to_visitor.pop(
+                        track_id,
+                        None
+                    )
 
-        if track_id in track_to_visitor:
+                    track_previous_y.pop(
+                        track_id,
+                        None
+                    )
 
-            visitor_id = (
-                track_to_visitor[
-                    track_id
-                ]
-            )
+                    track_last_event.pop(
+                        track_id,
+                        None
+                    )
 
-            print(
-                f"Track {track_id} "
-                f"lost "
-                f"(Visitor {visitor_id})"
-            )
+                    track_face_crops.pop(
+                        track_id,
+                        None
+                    )
 
-            # Remove tracking information
-            del track_to_visitor[
-                track_id
-            ]
+                    track_person_crops.pop(
+                        track_id,
+                        None
+                    )
 
+    # ------------------------------------------------------------
+    # DISPLAY FRAME INFORMATION
+    # ------------------------------------------------------------
 
-        if track_id in track_last_seen:
-
-            del track_last_seen[
-                track_id
-            ]
-
-
-        if track_id in track_previous_y:
-
-            del track_previous_y[
-                track_id
-            ]
-
-
-        if track_id in track_last_event:
-
-            del track_last_event[
-                track_id
-            ]
-
-
-    # ========================================================
-    # WRITE FRAME
-    # ========================================================
-
-    writer.write(
-        frame
+    cv2.putText(
+        frame,
+        f"Frame: {frame_count}",
+        (50, 70),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        1.2,
+        (255, 255, 255),
+        3
     )
 
+    cv2.putText(
+        frame,
+        f"Unique Visitors: {get_unique_visitor_count()}",
+        (50, 120),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        1.2,
+        (255, 255, 255),
+        3
+    )
 
-    # ========================================================
+    # ------------------------------------------------------------
+    # WRITE OUTPUT
+    # ------------------------------------------------------------
+
+    writer.write(frame)
+
+    # ------------------------------------------------------------
     # PROGRESS
-    # ========================================================
+    # ------------------------------------------------------------
 
-    if frame_number % 30 == 0:
+    if frame_count % 30 == 0:
 
         print(
-            f"Processed "
-            f"{frame_number}/"
-            f"{TOTAL_FRAMES} frames"
+            f"Processed frame {frame_count}"
         )
 
 
 # ============================================================
-# RELEASE RESOURCES
+# CLEANUP
 # ============================================================
 
 cap.release()
 
 writer.release()
 
-
-# ============================================================
-# FINAL RESULT
-# ============================================================
-
-print()
-print("=" * 60)
-print("PROCESSING COMPLETE")
-print("=" * 60)
-
-print(
-    f"Total frames processed: "
-    f"{frame_number}"
+log_event(
+    "SYSTEM_STOP",
+    visitor_id=0,
+    track_id=None,
+    details=(
+        f"Processing completed; "
+        f"frames={frame_count}; "
+        f"unique_visitors="
+        f"{get_unique_visitor_count()}"
+    )
 )
 
-print(
-    f"Unique visitors: "
-    f"{len(get_all_visitors())}"
-)
+print("\n" + "=" * 70)
+print("PROCESSING COMPLETED")
+print("=" * 70)
 
+print(f"Total frames     : {frame_count}")
 print(
-    f"Output video: "
-    f"{OUTPUT_VIDEO}"
+    f"Unique visitors  : "
+    f"{get_unique_visitor_count()}"
 )
+print(f"Output video     : {OUTPUT_VIDEO}")
+print(f"Event log        : {EVENT_LOG}")
+print(f"Entry images     : {ENTRY_LOG_DIR}")
+print(f"Exit images      : {EXIT_LOG_DIR}")
 
-print("=" * 60)
+print("=" * 70)
