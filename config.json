@@ -1,0 +1,11 @@
+{
+    "video_source": "data/sample_video.mp4",
+    "detection_skip_frames": 5,
+    "face_similarity_threshold": 0.60,
+    "min_face_size": 80,
+    "database_path": "database/visitors.db",
+    "entry_log_dir": "logs/entries",
+    "exit_log_dir": "logs/exits",
+    "output_video": "outputs/output.mp4",
+    "event_log": "logs/events.log"
+}

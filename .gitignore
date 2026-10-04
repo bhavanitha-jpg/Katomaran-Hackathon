@@ -1,0 +1,22 @@
+# Python virtual environment
+venv/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Database
+database/*.db
+
+# Logs
+logs/
+
+# Generated outputs
+outputs/
+
+# Large model files
+*.pt
+
+# OS files
+.DS_Store
+Thumbs.db
