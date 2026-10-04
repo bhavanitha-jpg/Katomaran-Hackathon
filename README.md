@@ -993,16 +993,7 @@ The repository contains the source code, configuration, project documentation, a
 Runtime-generated files such as logs, databases, and processed output files are excluded from version control where appropriate.
 
 39. Demo Video
-
-A short explanatory demo video is required for the hackathon submission.
-
-Demo video:
-
-## 9. Demo Video
-
-A short explanatory demo video is required for the hackathon submission.
-
-**Demo video:**  
+  
 [Watch the project demonstration on Loom](https://www.loom.com/share/2e3d57e5840445699ffa609582142282)
 
 The demonstration should cover:
