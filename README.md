@@ -998,7 +998,22 @@ A short explanatory demo video is required for the hackathon submission.
 
 Demo video:
 
-https://www.loom.com/share/2e3d57e5840445699ffa609582142282
+## 9. Demo Video
+
+A short explanatory demo video is required for the hackathon submission.
+
+**Demo video:**  
+[Watch the project demonstration on Loom](https://www.loom.com/share/2e3d57e5840445699ffa609582142282)
+
+The demonstration should cover:
+- Project overview
+- System architecture
+- Live/sample video processing
+- Person detection and tracking
+- Face recognition and auto-registration
+- Entry and exit event logging
+- Evidence images
+- SQLite database results
 
 The demonstration should cover:
 
