@@ -824,6 +824,7 @@ Better long-term visitor re-identification.
 More advanced event deduplication.
 Improved visitor embedding management.
 Automatic camera/ROI calibration.
+
 33. AI-Assisted Development and Planning
 
 AI coding assistants were used during development for:
@@ -994,7 +995,7 @@ Runtime-generated files such as logs, databases, and processed output files are 
 
 39. Demo Video
   
-[Watch the project demonstration on Loom](https://www.loom.com/share/2e3d57e5840445699ffa609582142282)
+[Watch the project demonstration on Loom](https://www.loom.com/share/2e3d57e5840445699ffa609582142282) 
 
 The demonstration should cover:
 - Project overview
@@ -1021,7 +1022,7 @@ SQLite event storage.
 Event logging.
 Processed output video.
 
-The video should also briefly explain the main implementation decisions and demonstrate the system running on the sample video.
+
 
 40. Submission Checklist
 Core Functionality
