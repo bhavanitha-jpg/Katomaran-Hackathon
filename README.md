@@ -59,7 +59,7 @@ The system is developed and tested using the provided sample video and is design
 
 # 3. System Architecture
 
-```text
+
                     Video / RTSP Stream
                             |
                             v
@@ -1007,23 +1007,6 @@ The demonstration should cover:
 - Evidence images
 - SQLite database results
 
-The demonstration should cover:
-
-Problem statement.
-Project architecture.
-YOLO11n person detection.
-ByteTrack tracking.
-InsightFace recognition.
-Automatic visitor registration.
-Unique visitor counting.
-ROI-based ENTRY/EXIT detection.
-Evidence image generation.
-SQLite event storage.
-Event logging.
-Processed output video.
-
-
-
 40. Submission Checklist
 Core Functionality
  YOLO-based detection
@@ -1066,6 +1049,7 @@ Submission
  Configuration file
  Sample video
  Final demo video link
+
 41. Conclusion
 
 This project implements an end-to-end intelligent visitor tracking pipeline using modern computer vision and face recognition technologies.
@@ -1093,7 +1077,5 @@ The implementation is designed to work with the provided sample video and can be
 The latest end-to-end validation successfully processed all 240 frames of the provided sample video and demonstrated visitor registration, recognition, tracking, event logging, database storage, and ROI-based event detection.
 
 42. Hackathon Statement
-
-# 42. Hackathon Statement
 
 This project is a part of a hackathon run by https://katomaran.com
