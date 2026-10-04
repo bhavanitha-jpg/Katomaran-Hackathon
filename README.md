@@ -998,7 +998,7 @@ A short explanatory demo video is required for the hackathon submission.
 
 Demo video:
 
-PASTE YOUR LOOM OR YOUTUBE LINK HERE
+https://www.loom.com/share/2e3d57e5840445699ffa609582142282
 
 The demonstration should cover:
 
